@@ -2,6 +2,7 @@
 #include <set>
 #include <map>
 #include <iostream>
+#include <utility>
 
 using salticidae::PeerId;
 using salticidae::PeerNetwork;
@@ -19,14 +20,18 @@ struct MsgHello {
     DataStream serialized;
     std::string name;
     std::string text;
+    uint32_t mid;
     /** Defines how to serialize the msg. */
     MsgHello(const std::string &name,
-             const std::string &text) {
+             const std::string &text,
+             uint32_t mid) {
+        serialized << mid;
         serialized << htole((uint32_t)name.length());
         serialized << name << text;
     }
     /** Defines how to parse the msg. */
     MsgHello(DataStream &&s) {
+        s >> mid;
         uint32_t len;
         s >> len;
         len = letoh(len);
@@ -40,87 +45,134 @@ struct MsgHello {
 struct MsgAck {
     static const uint8_t opcode = 0x1;
     DataStream serialized;
-    MsgAck() {}
-    MsgAck(DataStream &&s) {}
+    uint32_t nid;
+    uint32_t mid;
+    MsgAck(const int mid, const int nid) {
+        serialized << mid;
+        serialized << nid;
+    }
+    MsgAck(DataStream &&s) {
+        s >> mid;
+        s >> nid;
+    }
 };
 
 class MyNet: public Net {
-//    std::map<int, salticidae::PeerId> peerIdMap;
+    int fanout =2;
+    std::map<int, salticidae::PeerId> peerIdMap;
+    // mid:  <list of nid>
+    std::map<uint32_t, std::unordered_set<uint32_t>> ackSet;
 
     void on_receive_hello(MsgHello &&msg, const MyNet::conn_t &conn) {
-        printf("[%s] %s says %s\n", name.c_str(), msg.name.c_str(), msg.text.c_str());
+        printf("[%s] %s says %s, mid = %d\n", name.c_str(), msg.name.c_str(), msg.text.c_str(), msg.mid);
         /* send acknowledgement */
-        send_msg(MsgAck(), conn);
+        send_msg(MsgAck(msg.mid, id), conn);
+        /* send relay msg */
+        for (int tid = id*fanout+1; tid < (id +1)*fanout+1; ++tid) {
+            if (peerIdMap.find(tid) != peerIdMap.end()) {
+                const auto &peerId = peerIdMap[tid];
+                printf("[%s]  relay msg to %d, peer_port =%d\n", name.c_str(), tid, get_peer_conn(peerId)->get_peer_addr().port);
+                // send_msg(msg, peerId); ?
+                send_msg(MsgHello(name, "This is a relay broadcast!", msg.mid), peerId);
+            }
+        }
+
+        /* go through back up children */
+//        bool exit = false;
+//        int count = 0;
+//        while (!exit && count < 3) {
+//            exit = true;
+//            for (int tid = (id +1)*fanout+1; tid < peerIdMap.size()+1; ++tid) {
+//                if (peerIdMap.find(tid) != peerIdMap.end() && ackSet.find(tid) == ackSet.end()) {
+//                    printf("[%s] send to backup child %d\n", name.c_str(), tid);
+//                    send_msg(MsgHello(name, "This is a back up broadcast!"), peerIdMap[tid]);
+//                }
+//                exit = false;
+//                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+//            }
+//            count ++;
+//        }
     }
 
+    void on_receive_ack(MsgAck &&msg, const MyNet::conn_t &conn) {
+        auto net = static_cast<MyNet *>(conn->get_net());
+        printf("[%s] receive ack from %d\n", net->name.c_str(), msg.nid);
+        ackSet[msg.mid].insert(msg.nid);
+        /* notify parent */
+        if (id != 0) {
+            int pid = id/fanout;
+            const auto &peerId = peerIdMap[pid];
+            send_msg(MsgAck(msg.mid, msg.nid), peerId);
+        }
+    }
 public:
     MyNet(const salticidae::EventContext &ec,
           const MyNet::Config &config,
-          const std::string& name):
+          int id,
+          std::string  name):
             Net(ec, config),
-            name(name) {
+            id(id),
+            name(std::move(name)) {
         /* message handler could be a bound method */
-        reg_handler(
-                salticidae::generic_bind(&MyNet::on_receive_hello, this, _1, _2));
-
-        reg_conn_handler([this](const ConnPool::conn_t &conn, bool connected) {
-            if (connected)
-            {
-                if (conn->get_mode() == ConnPool::Conn::ACTIVE)
-                {
-                    printf("[%s] connected.\n",
-                           this->name.c_str());
-//                    /* send the first message through this connection */
-//                    send_msg(MsgHello(this->name, "Hello there!"),
-//                             salticidae::static_pointer_cast<Conn>(conn));
-                }
-                else
-                    printf("[%s] accepted, waiting for greetings.\n",
-                           this->name.c_str());
-            }
-            else
-            {
-                printf("[%s] disconnected, retrying.\n", this->name.c_str());
-                /* try to reconnect to the same address */
-//                connect(obj->get_addr());
-                auto obj = salticidae::static_pointer_cast<conn_t::type>(conn);
-                conn_peer(get_peer_id(obj, obj->get_addr()));
-            }
-            return true;
-        });
+        reg_handler(salticidae::generic_bind(&MyNet::on_receive_hello, this, _1, _2));
+        reg_handler(salticidae::generic_bind(&MyNet::on_receive_ack, this, _1, _2));
     }
 
+    auto add_peer(const salticidae::PeerId &peerId, int numid) {
+        peerIdMap[numid] = peerId;
+        return Net::add_peer(peerId);
+    }
+
+    uint32_t trigger() {
+        uint32_t mid = rand();
+        printf("[%s] let's do a broadcast!\n", name.c_str());
+        for (const auto &peerId : peerIdMap) {
+            printf("[%s]   send to %d\n", name.c_str(), peerId.first);
+            send_msg(MsgHello(name, "This is a flat broadcast!", mid), peerId.second);
+        }
+        return mid;
+    }
+
+    void trigger_backup(uint32_t mid) {
+        printf("[%s] trigger backup!\n", name.c_str());
+        if (ackSet.find(mid) != ackSet.end()) {
+            std::unordered_set<uint32_t> acks = ackSet[mid];
+            for (const auto &peerId : peerIdMap) {
+                if (acks.find(peerId.first) == acks.end()) {
+                    printf("[%s] send to backup child %d\n", name.c_str(), peerId.first);
+                    send_msg(MsgHello(name, "This is a back up broadcast!", mid), peerId.second);
+                }
+            } // to clean old msg
+        } // else, keep waiting or send to all again?
+    }
 //    std::set<PeerId> childPeers;
 //    std::unordered_set<uint256_t> valid_tls_certs;
 //    std::vector<PeerId> peers;
 //    /** network stack */
 //
+    const int id;
     const std::string name;
 };
 
-void on_receive_ack(MsgAck &&msg, const MyNet::conn_t &conn) {
-    auto net = static_cast<MyNet *>(conn->get_net());
-    printf("[%s] the peer knows\n", net->name.c_str());
-}
-
-int main() {
+int main(int argc, char* argv[]) {
 //    std::map<int, std::vector<int>> tree{{0, {1,2}},{1, {3,4}},{2, {5,6}}};
-    std::map<int, std::vector<int>> tree{{0, {1}},{1, {2}},{2, {3}}};
+    int size = atoi(argv[1]);
+    printf("node size=%d starts...\n", size);
+//    std::map<int, std::vector<int>> tree{{0, {1}},{1, {2}},{2, {3}}};
     std::vector<std::pair<salticidae::NetAddr, std::unique_ptr<MyNet>>> nodes;
     MyNet::Config config;
     salticidae::EventContext ec;
     config.ping_period(2);
-    nodes.resize(4);
+    nodes.resize(size);
     std::map<int, salticidae::PeerId> peerIdMap;
 
     for (size_t i = 0; i < nodes.size(); i++)
     {
         salticidae::NetAddr addr("127.0.0.1:" + std::to_string(10000 + i));
-        auto &net = (nodes[i] = std::make_pair(addr,  std::make_unique<MyNet>(ec, config, std::to_string(i)))).second;
+        auto &net = (nodes[i] = std::make_pair(addr,  std::make_unique<MyNet>(ec, config, i, std::to_string(i)))).second;
         salticidae::PeerId pid{addr};
         peerIdMap[i] = pid;
         std::cout << "addr port:" << addr.port << std::endl;
-        net->reg_handler(on_receive_ack);
         net->start();
         net->listen(addr);
     }
@@ -132,37 +184,11 @@ int main() {
                 auto &node = nodes[i].second;
                 auto &peer_addr = nodes[j].first;
                 salticidae::PeerId pid{peer_addr};
-                node->add_peer(pid);
+                node->add_peer(pid, (int) j);
                 node->set_peer_addr(pid, peer_addr);
                 node->conn_peer(pid);
                 usleep(10);
             }
-//    usleep(1000);
-    for (size_t i = 0; i < nodes.size(); i++) {
-//        printf("here:");
-        std::thread thread_object([&i, &nodes, &tree, &peerIdMap] {
-            if (tree.find(i) != tree.end()) {
-                printf("here:");
-                for (int k =0; k < tree[i].size(); k++) {
-                    printf("%d",tree[i][k]);
-                }
-//                sleep(1);
-                std::vector<salticidae::PeerId> children;
-                std::transform(
-                        tree[i].begin(), tree[i].end(), children.begin(), [&peerIdMap](int a) -> PeerId { return peerIdMap[a];});
-                int count = 0;
-                while (count < 30) {
-//                    printf("here:");
-//                    for (int k =0; k < children.size(); k++) {
-//                        printf("%s",children[k].to_hex().c_str());
-//                    }
-                    count ++;
-                    sleep(1);
-                    nodes[i].second->multicast_msg(MsgHello(std::to_string(i), "Hello there! count = " + std::to_string(count)), children);
-                };
-            }
-        });
-    }
 
     /* the main loop can be shutdown by ctrl-c or kill */
     auto shutdown = [&](int) {ec.stop();};
@@ -170,6 +196,15 @@ int main() {
     salticidae::SigEvent ev_sigterm(ec, shutdown);
     ev_sigint.add(SIGINT);
     ev_sigterm.add(SIGTERM);
+
+    salticidae::TimerEvent ev_timer(ec, [&nodes](auto && ...) {
+        uint32_t mid = nodes[0].second->trigger();
+        sleep(1);// suspend whole program ??
+        nodes[0].second->trigger_backup(mid);
+    });
+    for(int i = 0; i < 5; i++) {
+        ev_timer.add(0.5*i);
+    }
 
     ec.dispatch();
 }
