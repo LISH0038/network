@@ -25,9 +25,10 @@ struct MsgHello {
     MsgHello(const std::string &name,
              const std::string &text,
              uint32_t mid) {
+        std::vector<char> stuff(3048000, '.');
         serialized << mid;
         serialized << htole((uint32_t)name.length());
-        serialized << name << text;
+        serialized << name << text <<  std::string(stuff.begin(), stuff.end());
     }
     /** Defines how to parse the msg. */
     MsgHello(DataStream &&s) {
@@ -36,7 +37,7 @@ struct MsgHello {
         s >> len;
         len = letoh(len);
         name = std::string((const char *)s.get_data_inplace(len), len);
-        len = s.size();
+        len = 20;
         text = std::string((const char *)s.get_data_inplace(len), len);
     }
 };
@@ -68,15 +69,24 @@ class MyNet: public Net {
         /* send acknowledgement */
         send_msg(MsgAck(msg.mid, id), conn);
         /* send relay msg */
-        for (int tid = id*fanout+1; tid < (id +1)*fanout+1; ++tid) {
-            if (peerIdMap.find(tid) != peerIdMap.end()) {
-                const auto &peerId = peerIdMap[tid];
-                printf("[%s]  relay msg to %d, peer_port =%d\n", name.c_str(), tid, get_peer_conn(peerId)->get_peer_addr().port);
-                // send_msg(msg, peerId); ?
-                send_msg(MsgHello(name, "This is a relay broadcast!", msg.mid), peerId);
+        if (ackSet.find(msg.mid) != ackSet.end()) {
+            std::unordered_set<uint32_t> acks = ackSet[msg.mid];
+            for (int tid = id*fanout+1; tid < (id +1)*fanout+1; ++tid) {
+                if (acks.find(tid) == acks.end() && peerIdMap.find(tid) != peerIdMap.end()) {
+                    const auto &peerId = peerIdMap[tid];
+                    printf("[%s]  relay msg to %d, peer_port =%d\n", name.c_str(), tid, get_peer_conn(peerId)->get_peer_addr().port);
+                    send_msg(MsgHello(name, "This is a relay broadcast!", msg.mid), peerId);
+                }
+            }
+        } else {
+            for (int tid = id*fanout+1; tid < (id +1)*fanout+1; ++tid) {
+                if (peerIdMap.find(tid) != peerIdMap.end()) {
+                    const auto &peerId = peerIdMap[tid];
+                    printf("[%s]  relay msg to %d, peer_port =%d\n", name.c_str(), tid, get_peer_conn(peerId)->get_peer_addr().port);
+                    send_msg(MsgHello(name, "This is a relay broadcast!", msg.mid), peerId);
+                }
             }
         }
-
         /* go through back up children */
 //        bool exit = false;
 //        int count = 0;
@@ -126,9 +136,16 @@ public:
     uint32_t trigger() {
         uint32_t mid = rand();
         printf("[%s] let's do a broadcast!\n", name.c_str());
-        for (const auto &peerId : peerIdMap) {
-            printf("[%s]   send to %d\n", name.c_str(), peerId.first);
-            send_msg(MsgHello(name, "This is a flat broadcast!", mid), peerId.second);
+//        for (const auto &peerId : peerIdMap) {
+//            printf("[%s] send to %d\n", name.c_str(), peerId.first);
+//            send_msg(MsgHello(name, "This is a flat broadcast!", mid), peerId.second);
+//        }
+        for (int tid = id*fanout+1; tid < (id +1)*fanout+1; ++tid) {
+            if (peerIdMap.find(tid) != peerIdMap.end()) {
+                const auto &peerId = peerIdMap[tid];
+                printf("[%s] send to %d, peer_port =%d\n", name.c_str(), tid, get_peer_conn(peerId)->get_peer_addr().port);
+                send_msg(MsgHello(name, "This is a flat broadcast!", mid), peerId);
+            }
         }
         return mid;
     }
@@ -144,6 +161,12 @@ public:
                 }
             } // to clean old msg
         } // else, keep waiting or send to all again?
+        else {
+            for (const auto &peerId : peerIdMap) {
+                printf("[%s] send to backup child %d\n", name.c_str(), peerId.first);
+                send_msg(MsgHello(name, "This is a back up broadcast!", mid), peerId.second);
+            }
+        }
     }
 //    std::set<PeerId> childPeers;
 //    std::unordered_set<uint256_t> valid_tls_certs;
@@ -163,6 +186,7 @@ int main(int argc, char* argv[]) {
     MyNet::Config config;
     salticidae::EventContext ec;
     config.ping_period(2);
+    config.max_msg_size(10000000);
     nodes.resize(size);
     std::map<int, salticidae::PeerId> peerIdMap;
 
@@ -197,14 +221,16 @@ int main(int argc, char* argv[]) {
     ev_sigint.add(SIGINT);
     ev_sigterm.add(SIGTERM);
 
-    salticidae::TimerEvent ev_timer(ec, [&nodes](auto && ...) {
-        uint32_t mid = nodes[0].second->trigger();
-        sleep(1);// suspend whole program ??
+    uint32_t mid;
+    salticidae::TimerEvent ev_timer(ec, [&nodes, &mid](auto && ...) {
+        mid = nodes[0].second->trigger();
+    });
+    ev_timer.add(0.5);
+
+    salticidae::TimerEvent ev_timer_backup(ec, [&nodes, &mid](auto && ...) {
         nodes[0].second->trigger_backup(mid);
     });
-    for(int i = 0; i < 5; i++) {
-        ev_timer.add(0.5*i);
-    }
+    ev_timer_backup.add(0.7);
 
     ec.dispatch();
 }
